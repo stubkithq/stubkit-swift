@@ -1,9 +1,16 @@
 import Foundation
 
 // MARK: - HTTP Client
+//
+// Two auth surfaces:
+//  - Publishable key (pk_live_...): paywall config, event tracking.
+//  - Tenant JWT (end-user identity): entitlement reads, purchase sync.
+//
+// The configurator wires both; each request picks the right one.
 
 struct StubkitHTTP: Sendable {
-    let apiKey: String
+    let publishableKey: String
+    let getAuthToken: @Sendable () async throws -> String
     let baseURL: String
 
     private let session = URLSession.shared
@@ -18,21 +25,35 @@ struct StubkitHTTP: Sendable {
         return d
     }()
 
-    func get<T: Decodable>(path: String) async throws -> T {
-        try await request(method: "GET", path: path, body: nil as Empty?)
+    enum Auth {
+        case publishable
+        case tenantJwt
     }
 
-    func post<T: Decodable>(path: String) async throws -> T {
-        try await request(method: "POST", path: path, body: nil as Empty?)
+    func get<T: Decodable>(path: String, auth: Auth) async throws -> T {
+        try await request(method: "GET", path: path, body: nil as Empty?, auth: auth)
     }
 
-    func post<B: Encodable, T: Decodable>(path: String, body: B) async throws -> T {
-        try await request(method: "POST", path: path, body: body)
+    func post<T: Decodable>(path: String, auth: Auth) async throws -> T {
+        try await request(method: "POST", path: path, body: nil as Empty?, auth: auth)
+    }
+
+    func post<B: Encodable, T: Decodable>(path: String, body: B, auth: Auth) async throws -> T {
+        try await request(method: "POST", path: path, body: body, auth: auth)
     }
 
     // MARK: - Internal
 
-    private func request<B: Encodable, T: Decodable>(method: String, path: String, body: B?) async throws -> T {
+    private func bearer(for auth: Auth) async throws -> String {
+        switch auth {
+        case .publishable:
+            return publishableKey
+        case .tenantJwt:
+            return try await getAuthToken()
+        }
+    }
+
+    private func request<B: Encodable, T: Decodable>(method: String, path: String, body: B?, auth: Auth) async throws -> T {
         let maxRetries = 2
         let baseBackoff: UInt64 = 250_000_000 // 250ms in nanoseconds
 
@@ -40,12 +61,13 @@ struct StubkitHTTP: Sendable {
 
         for attempt in 0...maxRetries {
             do {
+                let token = try await bearer(for: auth)
                 var urlRequest = URLRequest(url: URL(string: "\(baseURL)\(path)")!)
                 urlRequest.httpMethod = method
-                urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
                 urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 urlRequest.setValue("application/json", forHTTPHeaderField: "Accept")
-                urlRequest.setValue("stubkit-swift/1.0.0", forHTTPHeaderField: "User-Agent")
+                urlRequest.setValue("stubkit-swift/1.0.1", forHTTPHeaderField: "User-Agent")
 
                 if let body {
                     urlRequest.httpBody = try encoder.encode(body)
